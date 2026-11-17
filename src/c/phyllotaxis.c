@@ -279,7 +279,7 @@ static void draw_centre(GContext *ctx, struct tm *t) {
   if (half < 12) half = 12;
   if (half > s_hole_r - 4) half = s_hole_r - 4;
   graphics_context_set_fill_color(ctx, GColorLightGray);
-  graphics_fill_rect(ctx, GRect(s_cx - half, s_cy + 1, 2 * half, 1), 0,
+  graphics_fill_rect(ctx, GRect(s_cx - half, s_cy, 2 * half, 1), 0,
                      GCornerNone);
 }
 
