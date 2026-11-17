@@ -1,70 +1,78 @@
 // Phyllotaxis — a Pebble watchface.
 //
-// Every minute one "seed" is added to a golden-angle (137.507°) spiral.
-// radius(n) = r0 + c*sqrt(n)   angle(n) = n * 137.507°
-// Seed colour follows the time of day through a dawn→day→dusk→night palette;
-// seed size and brightness follow the steps you took during that minute;
-// crossing each 1,000-step milestone stamps a bright accent seed.
-// The outer ring is step-goal progress, the inner ring is battery.
+// Every minute one "seed" is added to a golden-angle (137.507°) spiral:
+//   radius(n) = sqrt(r_in^2 + k*n)      angle(n) = n * 137.507°
+// The sqrt makes the seeds area-uniform across the annulus, which is what gives
+// the packed seed-head look rather than a bright rim and a hollow middle.
+//
+// Colour is spatial, not temporal: a slow teal -> green -> gold sweep across
+// the face. Seed size is uniform so the golden-angle lattice stays legible --
+// mixed sizes turn the spiral into confetti.
+//
+// The hub carries the time as HH over MM with a hairline rule, mirroring the
+// sunflower-head reference.
 
 #include <pebble.h>
 #include <math.h>
 
-#define GOLDEN_ANGLE     2.3999632297286535f   // 137.50776405° in radians
-#define PIF              3.14159265358979f
-#define MAX_SEEDS        1440                  // one minute per day
-#define STEP_GOAL        10000
-#define MILESTONE        1000
+#define GOLDEN_ANGLE   2.3999632297286535f   // 137.50776405° in radians
+#define PIF            3.14159265358979f
+#define DAY_MINUTES    1440
 
-// ---------------------------------------------------------------- data model
+// Seeds per day. One seed per minute is the original concept, but 1,440 seeds
+// on a 260 px dial sit on a 5.6 px lattice, and the largest circle that leaves
+// a black gap at that pitch is 4 px -- which rasterises as a plus, not a dot.
+// One seed per two minutes halves the count, doubles the pitch to 8 px and
+// lets real 6 px circles sit on it. Set to 1 for the denser original.
+#ifndef SEED_MINUTES
+#define SEED_MINUTES   2
+#endif
+#define MAX_SEEDS      (DAY_MINUTES / SEED_MINUTES)
+
+#define MIL_HOLE       315                   // hub radius, per mille of face R
+#define PCT_FILL       72                    // seed diameter, % of lattice pitch
 
 typedef struct {
   GColor8 c;
-  uint8_t r;
+  uint8_t d;                             // diameter in px
 } Seed;
 
 typedef struct {
-  uint16_t min;         // minutes since midnight
+  uint16_t t;                            // 0..1000 along the gradient axis
   uint8_t  r, g, b;
 } Stop;
 
-// Colour stops sit on the 4-level-per-channel grid the display can actually
-// show (0/85/170/255), so what we ask for is what gets drawn.
+// Spatial gradient across the face, teal (lower left) -> gold (upper right).
+// A narrow palette that never wraps is what reads as "formed"; a rainbow ramp
+// reads as noise. Values sit near the display's 4-levels-per-channel grid.
 static const Stop PALETTE[] = {
-  {    0,   0,   0,  85 },   // 00:00  navy
-  {  270,  85,   0, 170 },   // 04:30  indigo
-  {  390, 170,   0, 170 },   // 06:30  magenta dawn
-  {  510, 255,  85, 170 },   // 08:30  rose
-  {  720, 255, 170,  85 },   // 12:00  amber
-  {  900, 255, 255,  85 },   // 15:00  gold
-  { 1080, 255, 170,  85 },   // 18:00  amber dusk
-  { 1200, 255,  85,  85 },   // 20:00  coral
-  { 1320, 170,   0, 170 },   // 22:00  magenta
-  { 1440,   0,   0,  85 },   // 24:00  wrap
+  {    0,   8, 148, 138 },   // teal
+  {  320,  55, 172,  92 },   // green
+  {  640, 128, 188,  72 },   // yellow-green
+  { 1000, 245, 240, 120 },   // gold
 };
 #define N_STOPS ((int)(sizeof(PALETTE) / sizeof(PALETTE[0])))
 
 static Seed     s_seeds[MAX_SEEDS];
-static uint16_t s_n;                 // seeds currently in the field
+static uint16_t s_n;
 
 // ---------------------------------------------------------------- ui state
 
 static Window  *s_win;
 static Layer   *s_canvas;
-static GFont    s_f_time, s_f_info;
+static GFont    s_f_time;
 
 static int      s_w, s_h, s_cx, s_cy, s_R;
 static int      s_hole_r;
-static float    s_r_in, s_r_out;     // radial extent of the seed field
-static float    s_k;                 // r(n) = sqrt(r_in^2 + k*n)
-static float    s_pitch;             // mean nearest-neighbour distance
-static GRect    s_time_box;
+static float    s_r_in, s_r_out;
+static float    s_k;
+static int      s_dia = 4;
+static int      s_line_h, s_gap;
 
-static uint32_t s_steps, s_steps_prev, s_next_milestone;
 static int      s_battery = 100;
 static bool     s_bt = true;
 
-// ---------------------------------------------------------------- colour utils
+// ---------------------------------------------------------------- colour
 
 typedef struct { uint8_t r, g, b; } Rgb;
 
@@ -75,172 +83,57 @@ static Rgb rgb_of(int r, int g, int b) {
   return c;
 }
 
-static Rgb rgb_lerp(Rgb a, Rgb b, int t) {         // t: 0..256
-  return rgb_of(a.r + ((b.r - a.r) * t) / 256,
-                a.g + ((b.g - a.g) * t) / 256,
-                a.b + ((b.b - a.b) * t) / 256);
-}
-
-static Rgb rgb_scale(Rgb c, int num, int den) {
-  return rgb_of(c.r * num / den, c.g * num / den, c.b * num / den);
-}
-
-static GColor8 rgb_pack(Rgb c) {
-  return GColorFromRGB(c.r, c.g, c.b);
-}
-
-// Colour of the day phase at `minute` (0..1439).
-static Rgb phase_color(int minute) {
+// Colour at gradient position t (0..1000).
+static Rgb ramp(int t) {
+  if (t < 0) t = 0;
+  if (t > 1000) t = 1000;
   for (int i = 0; i < N_STOPS - 1; i++) {
-    if (minute >= PALETTE[i].min && minute < PALETTE[i + 1].min) {
-      int span = PALETTE[i + 1].min - PALETTE[i].min;
-      int t = span > 0 ? ((minute - PALETTE[i].min) * 256) / span : 0;
-      Rgb a = rgb_of(PALETTE[i].r, PALETTE[i].g, PALETTE[i].b);
-      Rgb b = rgb_of(PALETTE[i + 1].r, PALETTE[i + 1].g, PALETTE[i + 1].b);
-      return rgb_lerp(a, b, t);
+    if (t >= PALETTE[i].t && t <= PALETTE[i + 1].t) {
+      int span = PALETTE[i + 1].t - PALETTE[i].t;
+      int w = span > 0 ? (t - PALETTE[i].t) * 256 / span : 0;
+      return rgb_of(PALETTE[i].r + ((PALETTE[i + 1].r - PALETTE[i].r) * w) / 256,
+                    PALETTE[i].g + ((PALETTE[i + 1].g - PALETTE[i].g) * w) / 256,
+                    PALETTE[i].b + ((PALETTE[i + 1].b - PALETTE[i].b) * w) / 256);
     }
   }
-  return rgb_of(PALETTE[0].r, PALETTE[0].g, PALETTE[0].b);
+  return rgb_of(PALETTE[N_STOPS - 1].r, PALETTE[N_STOPS - 1].g,
+                PALETTE[N_STOPS - 1].b);
+}
+
+static GColor8 seed_color(GPoint p) {
+  int dx = p.x - s_cx, dy = p.y - s_cy;
+  int t = 500 + (780 * dx) / s_R + (190 * dy) / s_R;
+  Rgb c = ramp(t);
+  if (!s_bt) c = rgb_of(c.r * 3 / 5, c.g * 3 / 5, c.b * 3 / 5);
+  if (s_battery <= 15) c = rgb_of(c.r * 4 / 5, c.g * 4 / 5, c.b * 4 / 5);
+  return GColorFromRGB(c.r, c.g, c.b);
 }
 
 // ---------------------------------------------------------------- geometry
 
-static void recompute_geometry(GRect bounds) {
-  s_w = bounds.size.w;
-  s_h = bounds.size.h;
-  s_cx = s_w / 2;
-  s_cy = s_h / 2;
-#if defined(PBL_ROUND)
-  s_R = s_w / 2;
-#else
-  s_R = (s_w < s_h ? s_w : s_h) / 2;
-#endif
-
-  // Pick the largest time font that still leaves a decent hole.
-  static const char *cands[] = {
-    FONT_KEY_BITHAM_42_BOLD,
-    FONT_KEY_LECO_38_BOLD_NUMBERS,
-    FONT_KEY_BITHAM_34_MEDIUM_NUMBERS,
-    FONT_KEY_BITHAM_30_BLACK,
-    FONT_KEY_GOTHIC_28_BOLD,
-    FONT_KEY_GOTHIC_24_BOLD,
-  };
-  int best_w = 0;
-  s_f_time = fonts_get_system_font(cands[0]);
-  for (unsigned i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
-    GFont f = fonts_get_system_font(cands[i]);
-    GRect box = GRect(0, 0, s_w, 60);
-    GSize sz = graphics_text_layout_get_content_size("23:59", f, box,
-                                                     GTextOverflowModeFill,
-                                                     GTextAlignmentCenter);
-    if (sz.w <= (int)(s_R * 1.15f)) {    // leave room for the seed field
-      s_f_time = f;
-      best_w = sz.w;
-      break;
-    }
-  }
-  if (best_w == 0) best_w = (int)(s_R * 1.4f);
-
-  s_hole_r = best_w / 2 + 8;
-  if (s_hole_r > (int)(s_R * 0.62f)) s_hole_r = (int)(s_R * 0.62f);
-  if (s_hole_r < 24) s_hole_r = 24;
-
-  int r_in  = s_hole_r + 6;
-  int r_out = s_R - 7;                   // leave room for the step ring
-  if (r_out <= r_in + 4) r_out = r_in + 4;
-
-  // Area-preserving phyllotaxis: r(n) = sqrt(r_in^2 + k*n) keeps the seed
-  // density uniform across the annulus (a plain r0 + c*sqrt(n) crams
-  // everything against the inner edge).
-  s_r_in  = (float)r_in;
-  s_r_out = (float)r_out;
-  s_k = (s_r_out * s_r_out - s_r_in * s_r_in) / (float)(MAX_SEEDS - 1);
-  s_pitch = sqrtf(PIF * s_k);    // sqrt(area per seed)
-
-  GSize tsz = graphics_text_layout_get_content_size("23:59", s_f_time,
-                                                    GRect(0, 0, s_w, 60),
-                                                    GTextOverflowModeFill,
-                                                    GTextAlignmentCenter);
-  s_time_box = GRect(0, s_cy - tsz.h / 2 - 7, s_w, tsz.h + 4);
-}
-
-// ---------------------------------------------------------------- seeds
-
-// Seed *diameter* in pixels for `steps` taken in one minute. Most minutes are
-// quiet, so most seeds stay small and leave black space around themselves;
-// movement is what makes a seed fat.
-static uint8_t size_for(float steps) {
-  float want;
-  if (steps < 1.0f)       want = 2.6f;
-  else if (steps < 10.0f) want = 3.4f;
-  else if (steps < 40.0f) want = 4.4f;
-  else                    want = 6.0f;
-  // Scale to the room actually available: small screens must not overlap.
-  want *= s_pitch / 4.6f;
-  int d = (int)(want + 0.5f);
-  if (d < 1) d = 1;
-  if (d > 7) d = 7;
-  if (d == 6) d = 5;                      // 6 has no shape table
-  return (uint8_t)d;
-}
-
-// Brightness of a seed representing `steps` taken in one minute.
-static int brightness_for(float steps) {
-  if (steps < 1.0f)       return 200;    // idle minute
-  if (steps < 10.0f)      return 220;
-  if (steps < 40.0f)      return 240;
-  return 255;
-}
-
-static void push_seed(int seed_minute, int now_minute, float steps,
-                      bool milestone) {
-  if (s_n >= MAX_SEEDS) return;
-  Rgb c;
-  if (milestone) {
-    c = rgb_of(255, 244, 190);
-  } else {
-    c = phase_color(seed_minute);
-    c = rgb_scale(c, brightness_for(steps), 256);
-  }
-  // The freshest seeds glow: the leading edge of the spiral is "now".
-  int age = now_minute - seed_minute;     // 0 for the seed being added
-  if (age < 30) c = rgb_scale(c, 256 + (30 - age) * 3, 256);
-  if (!s_bt) c = rgb_scale(c, 3, 5);
-  if (s_battery <= 15) c = rgb_scale(c, 4, 5);
-  s_seeds[s_n].c = rgb_pack(c);
-  s_seeds[s_n].r = size_for(steps);
-  if (milestone && s_seeds[s_n].r < 5) s_seeds[s_n].r = 5;
-  s_n++;
-}
-
-static void fill_field_to(int minute, uint32_t steps_today) {
-  s_n = 0;
-  if (minute <= 0) return;
-  float avg = (float)steps_today / (float)minute;
-  for (int i = 0; i < minute; i++) push_seed(i, minute, avg, false);
-}
-
-// ---------------------------------------------------------------- drawing
-
-// Half-width of each row of a filled circle, r = 1..4.
-// Hand-tuned: a sqrt() span or a rounded rect both come out as plus signs at
-// these sizes, which turns the spiral into a lattice.
-// Seed shapes, by diameter. Below 5px any "circle" is really a plus sign, so
-// the small sizes are deliberate square dots.
-static const uint8_t ROWS_3[] = { 1, 1, 1 };
+// Half-width of each row of a filled seed. Below ~4 px a "circle" drawn from a
+// span function collapses into a plus sign, so 3 px is a deliberate plus: at
+// that size it reads rounder than any true circle the display can manage.
+static const uint8_t ROWS_3[] = { 0, 1, 0 };          // plus
 static const uint8_t ROWS_4[] = { 1, 2, 2, 1 };
 static const uint8_t ROWS_5[] = { 1, 2, 2, 2, 1 };
 static const uint8_t ROWS_7[] = { 2, 3, 3, 3, 3, 3, 2 };
+static const uint8_t ROWS_9[] = { 3, 4, 4, 4, 4, 4, 4, 4, 3 };
+static const uint8_t ROWS_8[] = { 1, 3, 3, 4, 4, 3, 3, 1 };
+static const uint8_t ROWS_6[] = { 1, 2, 3, 3, 2, 1 };
 
-static void fill_disc(GContext *ctx, GPoint p, int d) {
+static void fill_seed(GContext *ctx, GPoint p, int d) {
   const uint8_t *rows;
   int n;
   switch (d) {
+    case 9:  rows = ROWS_9; n = 9; break;
+    case 8:  rows = ROWS_8; n = 8; break;
+    case 6:  rows = ROWS_6; n = 6; break;
     case 7:  rows = ROWS_7; n = 7; break;
     case 5:  rows = ROWS_5; n = 5; break;
     case 4:  rows = ROWS_4; n = 4; break;
     case 3:  rows = ROWS_3; n = 3; break;
-    case 2:                       // 2x2 block
+    case 2:
       graphics_fill_rect(ctx, GRect(p.x - 1, p.y - 1, 2, 2), 0, GCornerNone);
       return;
     default:
@@ -255,6 +148,79 @@ static void fill_disc(GContext *ctx, GPoint p, int d) {
   }
 }
 
+static void recompute_geometry(GRect bounds) {
+  s_w = bounds.size.w;
+  s_h = bounds.size.h;
+  s_cx = s_w / 2;
+  s_cy = s_h / 2;
+#if defined(PBL_ROUND)
+  s_R = s_w / 2;
+#else
+  s_R = (s_w < s_h ? s_w : s_h) / 2;
+#endif
+
+  s_hole_r = (s_R * MIL_HOLE) / 1000;
+
+  int r_in  = s_hole_r + 3;
+  int r_out = s_R - 2;
+  if (r_out <= r_in + 6) r_out = r_in + 6;
+
+  s_r_in  = (float)r_in;
+  s_r_out = (float)r_out;
+  s_k = (s_r_out * s_r_out - s_r_in * s_r_in) / (float)(MAX_SEEDS - 1);
+
+  float pitch = sqrtf(PIF * s_k);          // mean nearest-neighbour distance
+  int d = (int)(pitch * (float)PCT_FILL / 100.0f + 0.5f);
+  if (d < 2) d = 2;
+  if (d > 9) d = 9;
+  s_dia = d;
+
+  // Time font: the largest variant whose two stacked lines fit the hub.
+  static const char *cands[] = {
+    FONT_KEY_LECO_28_LIGHT_NUMBERS,
+    FONT_KEY_LECO_20_BOLD_NUMBERS,
+    FONT_KEY_GOTHIC_18_BOLD,
+    FONT_KEY_GOTHIC_14_BOLD,
+  };
+  s_f_time = fonts_get_system_font(cands[0]);
+  for (unsigned i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
+    GFont f = fonts_get_system_font(cands[i]);
+    GSize sz = graphics_text_layout_get_content_size("88", f,
+                                                     GRect(0, 0, s_w, s_h),
+                                                     GTextOverflowModeFill,
+                                                     GTextAlignmentCenter);
+    if (sz.w * 10 <= s_hole_r * 13 && sz.h * 5 <= s_hole_r * 7) {
+      s_f_time = f;
+      s_line_h = sz.h;
+      break;
+    }
+  }
+  if (s_line_h == 0) s_line_h = 20;
+  s_gap = s_hole_r * 12 / 100;             // half-spacing around the rule
+}
+
+// ---------------------------------------------------------------- seeds
+
+static void push_seed(void) {
+  if (s_n >= MAX_SEEDS) return;
+  float ang = s_n * GOLDEN_ANGLE;
+  float rad = sqrtf(s_r_in * s_r_in + s_k * (float)s_n);
+  GPoint p = GPoint(s_cx + (int)lrintf(rad * cosf(ang)),
+                    s_cy + (int)lrintf(rad * sinf(ang)));
+  s_seeds[s_n].c = seed_color(p);
+  s_seeds[s_n].d = (uint8_t)s_dia;
+  s_n++;
+}
+
+static void fill_to(int minute) {
+  s_n = 0;
+  int want = minute / SEED_MINUTES;
+  if (want > MAX_SEEDS) want = MAX_SEEDS;
+  for (int i = 0; i < want; i++) push_seed();
+}
+
+// ---------------------------------------------------------------- drawing
+
 static void draw_field(GContext *ctx) {
   for (int i = 0; i < (int)s_n; i++) {
     float ang = i * GOLDEN_ANGLE;
@@ -262,152 +228,97 @@ static void draw_field(GContext *ctx) {
     GPoint p = GPoint(s_cx + (int)lrintf(rad * cosf(ang)),
                       s_cy + (int)lrintf(rad * sinf(ang)));
     graphics_context_set_fill_color(ctx, s_seeds[i].c);
-    fill_disc(ctx, p, s_seeds[i].r);
+    fill_seed(ctx, p, s_seeds[i].d);
   }
-}
-
-static void draw_gauges(GContext *ctx) {
-  if (!s_bt) return;
-  float prog = (float)s_steps / (float)STEP_GOAL;
-  if (prog > 1.0f) prog = 1.0f;
-  GColor8 step_col = rgb_pack(rgb_scale(phase_color(s_n), 230, 256));
-
-#if !defined(PBL_ROUND)
-  // Rect screens: step bar along the bottom, battery along the top.
-  graphics_context_set_fill_color(ctx, GColorFromRGB(32, 34, 44));
-  graphics_fill_rect(ctx, GRect(6, s_h - 8, s_w - 12, 4), 2, GCornersAll);
-  graphics_fill_rect(ctx, GRect(6, 4, s_w - 12, 3), 1, GCornersAll);
-  if (prog > 0.001f) {
-    graphics_context_set_fill_color(ctx, step_col);
-    graphics_fill_rect(ctx, GRect(6, s_h - 8, (int)((s_w - 12) * prog), 4),
-                       2, GCornersAll);
-  }
-  if (s_battery > 0) {
-    graphics_context_set_fill_color(ctx,
-        s_battery < 20 ? GColorFromRGB(255, 92, 70) : GColorFromRGB(236, 176, 120));
-    graphics_fill_rect(ctx, GRect(6, 4, ((s_w - 12) * s_battery) / 100, 3), 1,
-                       GCornersAll);
-  }
-#else
-  (void)ctx; (void)prog; (void)step_col;
-#endif
 }
 
 static void draw_centre(GContext *ctx, struct tm *t) {
-  // Clear the hub so the time is always legible.
+  // Clean circular void: without it the inner edge is a scallop of half-drawn
+  // seeds and the hub looks torn.
   graphics_context_set_fill_color(ctx, GColorBlack);
-  fill_disc(ctx, GPoint(s_cx, s_cy), s_hole_r - 1);
+  graphics_fill_circle(ctx, GPoint(s_cx, s_cy), s_hole_r);
 
-  static char buf[8];
+  char top[4], bot[4];
   if (clock_is_24h_style()) {
-    snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+    snprintf(top, sizeof(top), "%02d", t->tm_hour);
   } else {
     int h = t->tm_hour % 12;
-    if (h == 0) h = 12;
-    snprintf(buf, sizeof(buf), "%d:%02d", h, t->tm_min);
+    snprintf(top, sizeof(top), "%d", h == 0 ? 12 : h);
   }
-  graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, buf, s_f_time, s_time_box,
-                     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  snprintf(bot, sizeof(bot), "%02d", t->tm_min);
 
-  static char info[20];
-  static const char *days[] = { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
-  snprintf(info, sizeof(info), "%s %d  %d%%", days[t->tm_wday % 7], t->tm_mday,
-           s_battery);
-  GRect ibox = GRect(0, s_time_box.origin.y + s_time_box.size.h - 4,
-                     s_w, 20);
-  graphics_context_set_text_color(ctx, GColorFromRGB(150, 156, 176));
-  graphics_draw_text(ctx, info, s_f_info, ibox,
-                     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  GColor8 ink = GColorFromRGB(206, 184, 108);
+  graphics_context_set_text_color(ctx, ink);
 
-#if defined(PBL_ROUND)
-  // Step-goal progress as a slim bar under the date: keeps the spiral clean.
-  int barw = (s_hole_r * 2) - 16;
-  if (barw > 20) {
-    int by = ibox.origin.y + 18;
-    int bx = s_cx - barw / 2;
-    float prog = (float)s_steps / (float)STEP_GOAL;
-    if (prog > 1.0f) prog = 1.0f;
-    graphics_context_set_fill_color(ctx, GColorFromRGB(38, 40, 52));
-    graphics_fill_rect(ctx, GRect(bx, by, barw, 3), 1, GCornersAll);
-    if (prog > 0.001f && s_bt) {
-      graphics_context_set_fill_color(ctx,
-          rgb_pack(rgb_scale(phase_color(s_n), 230, 256)));
-      graphics_fill_rect(ctx, GRect(bx, by, (int)(barw * prog), 3), 1,
-                         GCornersAll);
-    }
-  }
-#endif
+  // Two boxes, not one multi-line string: a "\n" in a full-width box is laid
+  // out as a space, and a box only as tall as the type makes Pebble crush the
+  // glyphs against the edge. A box two lines tall aligns the text from the top
+  // with a constant gutter, so position it by hand from that constant.
+  int cap  = s_line_h * 70 / 100;          // glyph height
+  int lead = s_line_h * 32 / 100;          // space above the glyphs in the box
+  int g    = s_line_h * 14 / 100;          // half the gutter between the lines
+  GRect a = GRect(0, s_cy - g - cap - lead, s_w, s_line_h * 2);
+  GRect b = GRect(0, s_cy + g - lead, s_w, s_line_h * 2);
+  graphics_draw_text(ctx, top, s_f_time, a, GTextOverflowModeFill,
+                     GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, bot, s_f_time, b, GTextOverflowModeFill,
+                     GTextAlignmentCenter, NULL);
+
+  // Rule sits in the gutter between the two lines, with even air each side.
+  // A warm rule collapses into the same pixel colour as the digits under the
+  // display's colour correction, so the rule is neutral grey: it has to read as
+  // a divider, not as a third line of type.
+  GSize sz = graphics_text_layout_get_content_size(top, s_f_time,
+                                                   GRect(0, 0, s_w, s_h),
+                                                   GTextOverflowModeFill,
+                                                   GTextAlignmentCenter);
+  int half = sz.w * 3 / 8;
+  if (half < 12) half = 12;
+  if (half > s_hole_r - 4) half = s_hole_r - 4;
+  graphics_context_set_fill_color(ctx, GColorLightGray);
+  graphics_fill_rect(ctx, GRect(s_cx - half, s_cy + 1, 2 * half, 1), 0,
+                     GCornerNone);
 }
 
 static void canvas_update_proc(Layer *layer, GContext *ctx) {
-  GRect b = layer_get_bounds(layer);
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, b, 0, GCornerNone);
-
   time_t now = time(NULL);
   struct tm t = *localtime(&now);
 
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+
+  // Ticks are not guaranteed after a time jump (emulator, phone sync, DST), so
+  // the field is re-checked against the clock on every draw.
+  int minute = t.tm_hour * 60 + t.tm_min;
+  if (minute != (int)s_n) fill_to(minute);
+
   draw_field(ctx);
-  draw_gauges(ctx);
   draw_centre(ctx, &t);
 }
 
 // ---------------------------------------------------------------- services
 
-static void refresh_steps(void) {
-#ifdef PBL_HEALTH
-  s_steps = (uint32_t)health_service_sum_today(HealthMetricStepCount);
-#else
-  s_steps = 0;
-#endif
+static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
+  layer_mark_dirty(s_canvas);
 }
 
-static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
-  int minute = tick_time->tm_hour * 60 + tick_time->tm_min;
-  uint32_t prev = s_steps;
-  refresh_steps();
-
-  if (minute == 0 && s_n > 0) {           // new day: start blank
-    s_n = 0;
-    s_next_milestone = MILESTONE;
-  }
-
-  if (minute != (int)s_n) {
-    if (minute < (int)s_n) {
-      // Clock moved backwards (DST / sync): rebuild the field.
-      fill_field_to(minute, s_steps);
-      s_next_milestone = (s_steps / MILESTONE + 1) * MILESTONE;
-    } else {
-      uint32_t delta = s_steps >= prev ? s_steps - prev : 0;
-      while ((int)s_n < minute) {
-        bool milestone = s_steps >= s_next_milestone;
-        push_seed((int)s_n, minute, (float)delta, milestone);
-        if (milestone) s_next_milestone += MILESTONE;
-      }
-    }
-  }
-  layer_mark_dirty(s_canvas);
+// Recolour the seeds already in the field without rebuilding the spiral.
+static void recolour(void) {
+  int save = s_n;
+  fill_to(save);
 }
 
 static void battery_handler(BatteryChargeState s) {
   s_battery = s.charge_percent;
+  recolour();
   layer_mark_dirty(s_canvas);
 }
 
 static void bt_handler(bool connected) {
   s_bt = connected;
+  recolour();
   layer_mark_dirty(s_canvas);
 }
-
-#ifdef PBL_HEALTH
-static void health_handler(HealthEventType type, void *context) {
-  if (type == HealthEventMovementUpdate || type == HealthEventSignificantUpdate) {
-    refresh_steps();
-    if (s_canvas) layer_mark_dirty(s_canvas);
-  }
-}
-#endif
 
 // ---------------------------------------------------------------- lifecycle
 
@@ -416,39 +327,26 @@ static void window_load(Window *window) {
   GRect bounds = layer_get_bounds(root);
 
   recompute_geometry(bounds);
-  s_f_info = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
-
   s_canvas = layer_create(bounds);
   layer_set_update_proc(s_canvas, canvas_update_proc);
   layer_add_child(root, s_canvas);
 
-  refresh_steps();
-  s_steps_prev = s_steps;
-  s_next_milestone = (s_steps / MILESTONE + 1) * MILESTONE;
-
-  BatteryChargeState bs = battery_state_service_peek();
-  s_battery = bs.charge_percent;
+  s_battery = battery_state_service_peek().charge_percent;
   s_bt = bluetooth_connection_service_peek();
 
   time_t now = time(NULL);
   struct tm t = *localtime(&now);
-  fill_field_to(t.tm_hour * 60 + t.tm_min, s_steps);
+  fill_to(t.tm_hour * 60 + t.tm_min);
 
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
   battery_state_service_subscribe(battery_handler);
   bluetooth_connection_service_subscribe(bt_handler);
-#ifdef PBL_HEALTH
-  health_service_events_subscribe(health_handler, NULL);
-#endif
 }
 
 static void window_unload(Window *window) {
   tick_timer_service_unsubscribe();
   battery_state_service_unsubscribe();
   bluetooth_connection_service_unsubscribe();
-#ifdef PBL_HEALTH
-  health_service_events_unsubscribe();
-#endif
   layer_destroy(s_canvas);
 }
 

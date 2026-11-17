@@ -2,7 +2,10 @@
   "name": "phyllotaxis",
   "author": "Ben Oxley",
   "version": "1.0.0",
-  "keywords": ["pebble-app", "watchface"],
+  "keywords": [
+    "pebble-app",
+    "watchface"
+  ],
   "private": true,
   "dependencies": {},
   "pebble": {
@@ -10,11 +13,19 @@
     "uuid": "2f7c4b1e-9d3a-4c58-8e21-a6b4d0f1c7e3",
     "sdkVersion": "3",
     "enableMultiJS": false,
-    "targetPlatforms": ["gabbro", "emery", "chalk", "basalt", "diorite", "flint", "aplite"],
+    "targetPlatforms": [
+      "gabbro",
+      "emery",
+      "chalk",
+      "basalt",
+      "diorite",
+      "flint",
+      "aplite"
+    ],
     "watchapp": {
       "watchface": true
     },
-    "capabilities": ["health"],
+    "capabilities": [],
     "resources": {
       "media": []
     }
