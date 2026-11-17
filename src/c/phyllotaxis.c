@@ -41,12 +41,14 @@ typedef struct {
   uint8_t d;                             // diameter in px
 } Seed;
 
-// Hue of the day. 210 degrees at midnight is a cold blue; the wheel closes
-// again at 210 degrees by the next midnight, so the ramp is a true circle
-// rather than a strip with a visible join.
-#define HUE_START  210
+// Hue of the day, as a half wheel: amber at midnight, green around noon, blue
+// by the next midnight. Stopping at 180 degrees rather than a full 360 keeps the
+// field inside one family of warm-to-cool tones; a full wheel walks through
+// magenta and rose every evening and the seed head starts to look like confetti.
+#define HUE_START   30
+#define HUE_ARC    180                    // degrees walked between midnights
 #define HUE_SAT    215                    // 0..255
-#define VAL_NIGHT  110                    // brightness at midnight
+#define VAL_NIGHT  155                    // brightness at midnight
 #define VAL_DAY    255                    // brightness at midday
 
 static Seed     s_seeds[MAX_SEEDS];
@@ -101,7 +103,10 @@ static Rgb hue_rgb(int hue, int sat, int val) {
 // Colour of the seed representing `minute` past midnight.
 static GColor8 seed_color(int minute) {
   int t = minute % DAY_MINUTES;
-  int hue = (HUE_START + (360 * t) / DAY_MINUTES) % 360;
+  // A half wheel: amber at midnight through green at noon to blue at midnight,
+  // so the two ends of the day meet on a family of cool tones rather than
+  // wrapping through magenta. See HUE_ARC.
+  int hue = (HUE_START + (HUE_ARC * t) / DAY_MINUTES) % 360;
   // Sun curve: dark at 00:00 and 24:00, full brightness at noon.
   int val = VAL_NIGHT +
             ((VAL_DAY - VAL_NIGHT) * (int)(255.0f * sinf(PIF * (float)t / DAY_MINUTES))) / 255;

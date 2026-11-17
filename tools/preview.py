@@ -38,7 +38,7 @@ FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 def load_consts():
     src = open(SRC).read()
     out = {}
-    for name in ("HUE_START", "HUE_SAT", "VAL_NIGHT", "VAL_DAY", "SEED_MINUTES", "DAY_MINUTES"):
+    for name in ("HUE_START", "HUE_ARC", "HUE_SAT", "VAL_NIGHT", "VAL_DAY", "SEED_MINUTES", "DAY_MINUTES"):
         m = re.search(r"#define\s+%s\s+(\d+)" % name, src)
         out[name] = int(m.group(1)) if m else None
     return out
@@ -66,7 +66,7 @@ def seed_rgb(minute, hue_start=None, sat=None, v_night=None, v_day=None):
     v_night = C["VAL_NIGHT"] if v_night is None else v_night
     v_day = C["VAL_DAY"] if v_day is None else v_day
     t = minute % C["DAY_MINUTES"]
-    hue = (hue_start + (360 * t) // C["DAY_MINUTES"]) % 360
+    hue = (hue_start + (C["HUE_ARC"] * t) // C["DAY_MINUTES"]) % 360
     val = v_night + ((v_day - v_night) * int(255 * math.sin(math.pi * t / C["DAY_MINUTES"]))) // 255
     return tuple(int(v) for v in hue_rgb(hue, sat, val))
 
