@@ -48,7 +48,7 @@ typedef struct {
 #define HUE_START   30
 #define HUE_ARC    180                    // degrees walked between midnights
 #define HUE_SAT    215                    // 0..255
-#define VAL_NIGHT  155                    // brightness at midnight
+#define VAL_NIGHT  110                    // brightness at midnight
 #define VAL_DAY    255                    // brightness at midday
 
 static Seed     s_seeds[MAX_SEEDS];
