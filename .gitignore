@@ -1,0 +1,3 @@
+build/
+renders/*.png
+__pycache__/
