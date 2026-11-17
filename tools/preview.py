@@ -35,32 +35,45 @@ FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 # ---------------------------------------------------------------- palette
 
-def load_palette():
+def load_consts():
     src = open(SRC).read()
-    body = re.search(r"static const Stop PALETTE\[\] = \{(.*?)\};", src, re.S).group(1)
-    stops = []
-    for m in re.finditer(r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}", body):
-        stops.append(tuple(int(g) for g in m.groups()))
-    return stops
+    out = {}
+    for name in ("HUE_START", "HUE_SAT", "VAL_NIGHT", "VAL_DAY", "SEED_MINUTES", "DAY_MINUTES"):
+        m = re.search(r"#define\s+%s\s+(\d+)" % name, src)
+        out[name] = int(m.group(1)) if m else None
+    return out
 
 
-PALETTE = load_palette()
+C = load_consts()
 
 
-def ramp(t, palette=None):
-    """t in 0..1000 -> RGB along the field gradient."""
-    palette = palette or PALETTE
-    t = max(0, min(1000, t))
-    for i in range(len(palette) - 1):
-        a, b = palette[i], palette[i + 1]
-        if a[0] <= t <= b[0]:
-            span = b[0] - a[0]
-            f = (t - a[0]) / span if span else 0
-            return tuple(int(a[k + 1] + (b[k + 1] - a[k + 1]) * f) for k in (0, 1, 2))
-    return tuple(int(v) for v in palette[-1][1:])
+def hue_rgb(hue, sat, val):
+    """Mirror of hue_rgb() in the firmware."""
+    hue %= 360
+    f = (hue % 60) * 255 // 60
+    p = val * (255 - sat) // 255
+    q = val * (255 - sat * f // 255) // 255
+    t = val * (255 - sat * (255 - f) // 255) // 255
+    r = hue // 60
+    return [(val, t, p), (q, val, p), (p, val, t),
+            (p, q, val), (t, p, val), (val, p, q)][r]
+
+
+def seed_rgb(minute, hue_start=None, sat=None, v_night=None, v_day=None):
+    """Colour of the seed for `minute` past midnight, matching seed_color()."""
+    hue_start = C["HUE_START"] if hue_start is None else hue_start
+    sat = C["HUE_SAT"] if sat is None else sat
+    v_night = C["VAL_NIGHT"] if v_night is None else v_night
+    v_day = C["VAL_DAY"] if v_day is None else v_day
+    t = minute % C["DAY_MINUTES"]
+    hue = (hue_start + (360 * t) // C["DAY_MINUTES"]) % 360
+    val = v_night + ((v_day - v_night) * int(255 * math.sin(math.pi * t / C["DAY_MINUTES"]))) // 255
+    return tuple(int(v) for v in hue_rgb(hue, sat, val))
 
 
 # ---------------------------------------------------------------- geometry
+
+HUE = {}          # per-variant override of hue_start/sat/v_night/v_day
 
 # Tunables (the firmware mirrors these)
 HOLE = 0.315      # hub radius / face radius
@@ -74,7 +87,7 @@ def geometry(w, h, round_):
     hole_r = int(R * HOLE)
     r_in = hole_r + 3
     r_out = R - 3
-    n = int(MAX_SEEDS * FULL)
+    n = int((C["DAY_MINUTES"] // C["SEED_MINUTES"]) * FULL)
     k = (r_out ** 2 - r_in ** 2) / (n - 1)
     pitch = math.sqrt(math.pi * k)
     return cx, cy, R, hole_r, r_in, k, pitch, n
@@ -97,7 +110,7 @@ def render(platform="gabbro", minute=767, scale=3, show_time=True,
     d = ImageDraw.Draw(img)
     cx, cy, R, hole_r, r_in, k, pitch, n_visible = geometry(w, h, rnd)
 
-    n = min(minute, n_visible)
+    n = min(minute // C["SEED_MINUTES"], n_visible)
     dia = seed_diameter(pitch) * scale
 
     for i in range(n):
@@ -105,9 +118,7 @@ def render(platform="gabbro", minute=767, scale=3, show_time=True,
         rad = math.sqrt(r_in ** 2 + k * i)
         x = cx + rad * math.cos(ang)
         y = cy + rad * math.sin(ang)
-        # Diagonal gradient: teal lower-left -> yellow upper-right-ish
-        t = 500 + 780 * (x - cx) / R + 190 * (y - cy) / R
-        c = ramp(t)
+        c = seed_rgb(i * C["SEED_MINUTES"], **HUE)
         if not bt:
             c = tuple(int(v * 3 / 5) for v in c)
         if battery <= 15:

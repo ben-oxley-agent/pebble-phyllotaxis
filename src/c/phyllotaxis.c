@@ -5,9 +5,13 @@
 // The sqrt makes the seeds area-uniform across the annulus, which is what gives
 // the packed seed-head look rather than a bright rim and a hollow middle.
 //
-// Colour is spatial, not temporal: a slow teal -> green -> gold sweep across
-// the face. Seed size is uniform so the golden-angle lattice stays legible --
-// mixed sizes turn the spiral into confetti.
+// Colour is temporal: a seed takes its hue from the minute it represents, and
+// the hue walks a full 360 degrees around the wheel between midnight and
+// midnight. Because the spiral is laid down in time order, that turns the seed
+// head into a clock face of colour -- blue at the centre (midnight), sweeping
+// through green morning, gold midday and magenta evening, closing back on blue
+// at the rim. Brightness follows the sun as well, so the small hours are dim.
+// Seed size is uniform; mixed sizes turn the lattice into confetti.
 //
 // The hub carries the time as HH over MM with a hairline rule, mirroring the
 // sunflower-head reference.
@@ -37,21 +41,13 @@ typedef struct {
   uint8_t d;                             // diameter in px
 } Seed;
 
-typedef struct {
-  uint16_t t;                            // 0..1000 along the gradient axis
-  uint8_t  r, g, b;
-} Stop;
-
-// Spatial gradient across the face, teal (lower left) -> gold (upper right).
-// A narrow palette that never wraps is what reads as "formed"; a rainbow ramp
-// reads as noise. Values sit near the display's 4-levels-per-channel grid.
-static const Stop PALETTE[] = {
-  {    0,   8, 148, 138 },   // teal
-  {  320,  55, 172,  92 },   // green
-  {  640, 128, 188,  72 },   // yellow-green
-  { 1000, 245, 240, 120 },   // gold
-};
-#define N_STOPS ((int)(sizeof(PALETTE) / sizeof(PALETTE[0])))
+// Hue of the day. 210 degrees at midnight is a cold blue; the wheel closes
+// again at 210 degrees by the next midnight, so the ramp is a true circle
+// rather than a strip with a visible join.
+#define HUE_START  210
+#define HUE_SAT    215                    // 0..255
+#define VAL_NIGHT  110                    // brightness at midnight
+#define VAL_DAY    255                    // brightness at midday
 
 static Seed     s_seeds[MAX_SEEDS];
 static uint16_t s_n;
@@ -83,27 +79,33 @@ static Rgb rgb_of(int r, int g, int b) {
   return c;
 }
 
-// Colour at gradient position t (0..1000).
-static Rgb ramp(int t) {
-  if (t < 0) t = 0;
-  if (t > 1000) t = 1000;
-  for (int i = 0; i < N_STOPS - 1; i++) {
-    if (t >= PALETTE[i].t && t <= PALETTE[i + 1].t) {
-      int span = PALETTE[i + 1].t - PALETTE[i].t;
-      int w = span > 0 ? (t - PALETTE[i].t) * 256 / span : 0;
-      return rgb_of(PALETTE[i].r + ((PALETTE[i + 1].r - PALETTE[i].r) * w) / 256,
-                    PALETTE[i].g + ((PALETTE[i + 1].g - PALETTE[i].g) * w) / 256,
-                    PALETTE[i].b + ((PALETTE[i + 1].b - PALETTE[i].b) * w) / 256);
-    }
+// HSV -> RGB with hue in degrees. Only one sextant of the circle is active at
+// a time, so this is a couple of multiplies and a switch.
+static Rgb hue_rgb(int hue, int sat, int val) {
+  hue %= 360;
+  if (hue < 0) hue += 360;
+  int f = (hue % 60) * 255 / 60;
+  int p = val * (255 - sat) / 255;
+  int q = val * (255 - sat * f / 255) / 255;
+  int t = val * (255 - sat * (255 - f) / 255) / 255;
+  switch (hue / 60) {
+    case 0:  return rgb_of(val, t, p);
+    case 1:  return rgb_of(q, val, p);
+    case 2:  return rgb_of(p, val, t);
+    case 3:  return rgb_of(p, q, val);
+    case 4:  return rgb_of(t, p, val);
+    default: return rgb_of(val, p, q);
   }
-  return rgb_of(PALETTE[N_STOPS - 1].r, PALETTE[N_STOPS - 1].g,
-                PALETTE[N_STOPS - 1].b);
 }
 
-static GColor8 seed_color(GPoint p) {
-  int dx = p.x - s_cx, dy = p.y - s_cy;
-  int t = 500 + (780 * dx) / s_R + (190 * dy) / s_R;
-  Rgb c = ramp(t);
+// Colour of the seed representing `minute` past midnight.
+static GColor8 seed_color(int minute) {
+  int t = minute % DAY_MINUTES;
+  int hue = (HUE_START + (360 * t) / DAY_MINUTES) % 360;
+  // Sun curve: dark at 00:00 and 24:00, full brightness at noon.
+  int val = VAL_NIGHT +
+            ((VAL_DAY - VAL_NIGHT) * (int)(255.0f * sinf(PIF * (float)t / DAY_MINUTES))) / 255;
+  Rgb c = hue_rgb(hue, HUE_SAT, val);
   if (!s_bt) c = rgb_of(c.r * 3 / 5, c.g * 3 / 5, c.b * 3 / 5);
   if (s_battery <= 15) c = rgb_of(c.r * 4 / 5, c.g * 4 / 5, c.b * 4 / 5);
   return GColorFromRGB(c.r, c.g, c.b);
@@ -203,11 +205,7 @@ static void recompute_geometry(GRect bounds) {
 
 static void push_seed(void) {
   if (s_n >= MAX_SEEDS) return;
-  float ang = s_n * GOLDEN_ANGLE;
-  float rad = sqrtf(s_r_in * s_r_in + s_k * (float)s_n);
-  GPoint p = GPoint(s_cx + (int)lrintf(rad * cosf(ang)),
-                    s_cy + (int)lrintf(rad * sinf(ang)));
-  s_seeds[s_n].c = seed_color(p);
+  s_seeds[s_n].c = seed_color((int)s_n * SEED_MINUTES);
   s_seeds[s_n].d = (uint8_t)s_dia;
   s_n++;
 }
