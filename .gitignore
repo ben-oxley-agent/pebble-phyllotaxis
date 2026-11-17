@@ -1,3 +1,5 @@
 build/
+compat/build/
 renders/*.png
+dist/*.zip
 __pycache__/
