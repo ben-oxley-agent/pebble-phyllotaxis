@@ -37,8 +37,9 @@
 #define PCT_FILL       72                    // seed diameter, % of lattice pitch
 
 typedef struct {
-  GColor8 c;
-  uint8_t d;                             // diameter in px
+  GColor8 lo, hi;                        // the two nearest palette entries
+  uint8_t d   : 4;                       // diameter in px
+  uint8_t mix : 4;                       // 0..16 share of rows drawn in `hi`
 } Seed;
 
 // Hue of the day, as a half wheel: amber at midnight, green around noon, blue
@@ -50,6 +51,11 @@ typedef struct {
 #define HUE_SAT    215                    // 0..255
 #define VAL_NIGHT  110                    // brightness at midnight
 #define VAL_DAY    255                    // brightness at midday
+
+// 1 = halftone each blob between the two nearest palette entries, 0 = solid.
+#ifndef DITHER
+#define DITHER     0
+#endif
 
 static Seed     s_seeds[MAX_SEEDS];
 static uint16_t s_n;
@@ -100,8 +106,36 @@ static Rgb hue_rgb(int hue, int sat, int val) {
   }
 }
 
-// Colour of the seed representing `minute` past midnight.
-static GColor8 seed_color(int minute) {
+// ---------------------------------------------------------------- dithering
+//
+// The display has four levels per channel, so a hue ramp that moves 0.125 deg
+// per seed hits the same palette entry for a dozen seeds in a row and the
+// gradient steps in visible bands. Ordered dithering between the two nearest
+// levels buys back roughly two bits per channel: each seed still draws clean,
+// but neighbouring seeds alternate, and the eye averages the pairs.
+//
+// A 4x4 Bayer matrix keyed on the seed index gives a spatially scattered,
+// repeatable pattern -- random thresholds would just look like noise, and a
+// screen-space matrix would clump because phyllotaxis neighbours are far apart
+// in index.
+static const uint8_t BAYER4[16] = {
+   0,  8,  2, 10,
+  12,  4, 14,  6,
+   3, 11,  1,  9,
+  15,  7, 13,  5,
+};
+
+static GColor8 make_color(int r2, int g2, int b2) {
+  if (r2 > 3) r2 = 3;
+  if (g2 > 3) g2 = 3;
+  if (b2 > 3) b2 = 3;
+  return (GColor8) { .a = 3, .r = r2, .g = g2, .b = b2 };
+}
+
+// Colour of the seed representing `minute` past midnight, as the two palette
+// entries either side of it plus the share of the blob that should take the
+// upper one.
+static void seed_color(int minute, GColor8 *lo, GColor8 *hi, uint8_t *mix) {
   int t = minute % DAY_MINUTES;
   // A half wheel: amber at midnight through green at noon to blue at midnight,
   // so the two ends of the day meet on a family of cool tones rather than
@@ -113,7 +147,14 @@ static GColor8 seed_color(int minute) {
   Rgb c = hue_rgb(hue, HUE_SAT, val);
   if (!s_bt) c = rgb_of(c.r * 3 / 5, c.g * 3 / 5, c.b * 3 / 5);
   if (s_battery <= 15) c = rgb_of(c.r * 4 / 5, c.g * 4 / 5, c.b * 4 / 5);
-  return GColorFromRGB(c.r, c.g, c.b);
+
+  int lr = c.r / 85, lg = c.g / 85, lb = c.b / 85;
+  int fr = c.r - lr * 85, fg = c.g - lg * 85, fb = c.b - lb * 85;
+  *lo = make_color(lr, lg, lb);
+  *hi = make_color(lr + 1, lg + 1, lb + 1);
+  // Average the three channel fractions: one blob can only mix two colours,
+  // so it aims for the same overall lift rather than a per-channel one.
+  *mix = (uint8_t)(((fr + fg + fb) * 16) / (3 * 85 + 1));
 }
 
 // ---------------------------------------------------------------- geometry
@@ -129,7 +170,23 @@ static const uint8_t ROWS_9[] = { 3, 4, 4, 4, 4, 4, 4, 4, 3 };
 static const uint8_t ROWS_8[] = { 1, 3, 3, 4, 4, 3, 3, 1 };
 static const uint8_t ROWS_6[] = { 1, 2, 3, 3, 2, 1 };
 
-static void fill_seed(GContext *ctx, GPoint p, int d) {
+static void gcolor_fill_disc(GContext *ctx, GPoint p, const uint8_t *rows,
+                             int n, GColor8 c) {
+  graphics_context_set_fill_color(ctx, c);
+  int top = p.y - (n - 1) / 2;
+  for (int i = 0; i < n; i++) {
+    graphics_fill_rect(ctx, GRect(p.x - rows[i], top + i, 2 * rows[i] + 1, 1),
+                       0, GCornerNone);
+  }
+}
+
+// Draws one seed as a halftone of the two nearest palette entries: the disc is
+// laid down in the lower colour, then a 4x4 ordered-dither mask punches the
+// upper colour through it. The blob keeps its shape and its average colour is
+// the one the gradient wanted, which is the extra two bits per channel the
+// 64-colour display cannot otherwise give.
+static void fill_seed(GContext *ctx, GPoint p, int d, GColor8 lo, GColor8 hi,
+                      uint8_t mix) {
   const uint8_t *rows;
   int n;
   switch (d) {
@@ -141,17 +198,35 @@ static void fill_seed(GContext *ctx, GPoint p, int d) {
     case 4:  rows = ROWS_4; n = 4; break;
     case 3:  rows = ROWS_3; n = 3; break;
     case 2:
+      graphics_context_set_fill_color(ctx, mix >= 8 ? hi : lo);
       graphics_fill_rect(ctx, GRect(p.x - 1, p.y - 1, 2, 2), 0, GCornerNone);
       return;
     default:
+      graphics_context_set_fill_color(ctx, mix >= 8 ? hi : lo);
       graphics_fill_rect(ctx, GRect(p.x, p.y, 1, 1), 0, GCornerNone);
       return;
   }
+
+  if (mix <= 0) {
+    gcolor_fill_disc(ctx, p, rows, n, lo);
+    return;
+  }
+  if (mix >= 16) {
+    gcolor_fill_disc(ctx, p, rows, n, hi);
+    return;
+  }
+
+  gcolor_fill_disc(ctx, p, rows, n, lo);
+  graphics_context_set_fill_color(ctx, hi);
   int top = p.y - (n - 1) / 2;
   for (int i = 0; i < n; i++) {
     int half = rows[i];
-    graphics_fill_rect(ctx, GRect(p.x - half, top + i, 2 * half + 1, 1), 0,
-                       GCornerNone);
+    for (int dx = -half; dx <= half; dx++) {
+      int x = p.x + dx, y = top + i;
+      if (BAYER4[(x & 3) + (y & 3) * 4] < mix) {
+        graphics_fill_rect(ctx, GRect(x, y, 1, 1), 0, GCornerNone);
+      }
+    }
   }
 }
 
@@ -210,7 +285,13 @@ static void recompute_geometry(GRect bounds) {
 
 static void push_seed(void) {
   if (s_n >= MAX_SEEDS) return;
-  s_seeds[s_n].c = seed_color((int)s_n * SEED_MINUTES);
+  GColor8 lo, hi;
+  uint8_t mix;
+  seed_color((int)s_n * SEED_MINUTES, &lo, &hi, &mix);
+  if (!DITHER) mix = 0;
+  s_seeds[s_n].lo = lo;
+  s_seeds[s_n].hi = hi;
+  s_seeds[s_n].mix = mix;
   s_seeds[s_n].d = (uint8_t)s_dia;
   s_n++;
 }
@@ -230,8 +311,8 @@ static void draw_field(GContext *ctx) {
     float rad = sqrtf(s_r_in * s_r_in + s_k * (float)i);
     GPoint p = GPoint(s_cx + (int)lrintf(rad * cosf(ang)),
                       s_cy + (int)lrintf(rad * sinf(ang)));
-    graphics_context_set_fill_color(ctx, s_seeds[i].c);
-    fill_seed(ctx, p, s_seeds[i].d);
+    fill_seed(ctx, p, s_seeds[i].d, s_seeds[i].lo, s_seeds[i].hi,
+              s_seeds[i].mix);
   }
 }
 
